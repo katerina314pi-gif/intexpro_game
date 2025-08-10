@@ -1,148 +1,139 @@
 // netlify/functions/sendLead.js
-// Принимает:
+// Принимает из фронта:
 // {
 //   name: "Имя ребёнка",
 //   phone: "79991234567" | "+7 (999) 123-45-67",
 //   email: "optional",
 //   note: "текст",
-//   // удобный формат с названиями:
-//   attributes: [ { name:"parent1", value:"Мама Анна" }, { name:"discount", value:"7" } ]
-//   // также поддержим уже «правильный» формат:
-//   // attributes: [ { attributeId: 123, value: "..." } ]
+//   attributes: [ { name:"parent1", value:"Мама Анна" }, { name:"discount", value:"10" } ]
 // }
+// Функция сама находит attributeId по названиям признаков (parent1, discount).
 
 export async function handler(event) {
-  const cors = {
+  const CORS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "POST,OPTIONS"
   };
-
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: cors, body: "" };
-  }
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, headers: cors, body: "Only POST" };
-  }
+  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: CORS, body: "" };
+  if (event.httpMethod !== "POST") return { statusCode: 405, headers: CORS, body: "Only POST" };
 
   try {
-    // ---------- вход ----------
     const body = JSON.parse(event.body || "{}");
     let { name, phone, email, note, attributes } = body;
-
     if (!name) throw new Error("Missing name");
     if (!phone) throw new Error("Missing phone");
 
-    // ---------- нормализуем телефон ----------
+    // нормализуем телефон под МойКласс: 11 цифр, первая 7
     phone = String(phone).replace(/\D/g, "");
     if (phone.length === 11 && phone[0] === "8") phone = "7" + phone.slice(1);
     if (phone.length === 10) phone = "7" + phone;
     if (!(phone.length === 11 && phone[0] === "7")) {
-      return resp(400, { ok:false, error:"Phone must be 11 digits starting with 7" }, cors);
+      return j(400, { ok:false, error:"Phone must be 11 digits starting with 7" });
     }
 
-    // ---------- маппинг признаков name -> attributeId ----------
-    const PARENT1_ID = process.env.ATTR_PARENT1_ID ? Number(process.env.ATTR_PARENT1_ID) : null;
-    const DISCOUNT_ID = process.env.ATTR_DISCOUNT_ID ? Number(process.env.ATTR_DISCOUNT_ID) : null;
+    // читаем ключ из env (любой из двух)
+    const API_KEY = process.env.MK_API_KEY || process.env.MOYKLASS_API_KEY || "";
+    if (!API_KEY) return j(500, { ok:false, error:"MK_API_KEY not set in Netlify env" });
 
-    let attrsOut = [];
+    // 1) токен
+    const authRes = await fetch("https://api.moyklass.com/v1/company/auth/getToken", {
+      method:"POST", headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({ apiKey: API_KEY })
+    });
+    if (!authRes.ok) return j(401, { ok:false, error:`Auth error: ${await t(authRes)}` });
+    const auth = await authRes.json().catch(()=>({}));
+    const token = auth.accessToken || auth.token || auth.access_token;
+    if (!token) return j(401, { ok:false, error:"Auth error: no token in response" });
+
+    // 2) найдём ID системных признаков по их коду/имени
+    // у разных аккаунтов пути в API могут отличаться, поэтому пробуем несколько
+    const attrList = await fetchAttributesList(token);
+    if (!Array.isArray(attrList) || !attrList.length) {
+      return j(502, { ok:false, error:"Cannot read attributes list from API" });
+    }
+
+    // В ответах встречаются поля вида: { id, attributeId, code, name, system, ... }
+    // Нас интересуют parent1 и discount. Иногда code = "user.parent1"/"user.discount".
+    const parentId = findAttrId(attrList, ["parent1","user.parent1"]);
+    const discountId = findAttrId(attrList, ["discount","user.discount"]);
+
+    // Сформируем массив { attributeId, value } из удобного формата
+    const outAttrs = [];
     if (Array.isArray(attributes)) {
       for (const a of attributes) {
         if (!a) continue;
-
-        // уже пришёл правильный формат
         if (typeof a.attributeId === "number") {
-          attrsOut.push({ attributeId: a.attributeId, value: a.value != null ? String(a.value) : "" });
-          continue;
+          outAttrs.push({ attributeId: a.attributeId, value: a.value != null ? String(a.value) : "" });
+        } else if (a.name === "parent1" && parentId) {
+          outAttrs.push({ attributeId: parentId, value: a.value != null ? String(a.value) : "" });
+        } else if (a.name === "discount" && discountId) {
+          outAttrs.push({ attributeId: discountId, value: a.value != null ? String(a.value) : "" });
         }
-
-        // поддержка удобного формата {name, value}
-        const nm = (a.name || "").toString().trim().toLowerCase();
-        if (nm === "parent1") {
-          if (!PARENT1_ID) {
-            return resp(500, { ok:false, error:"Set ATTR_PARENT1_ID in Netlify env" }, cors);
-          }
-          attrsOut.push({ attributeId: PARENT1_ID, value: a.value != null ? String(a.value) : "" });
-          continue;
-        }
-        if (nm === "discount") {
-          if (!DISCOUNT_ID) {
-            return resp(500, { ok:false, error:"Set ATTR_DISCOUNT_ID in Netlify env" }, cors);
-          }
-          attrsOut.push({ attributeId: DISCOUNT_ID, value: a.value != null ? String(a.value) : "" });
-          continue;
-        }
-        // если прилетело что-то ещё — игнорим молча
       }
     }
+    // Если что-то из ID не нашли — не падаем, просто не отправляем этот признак.
+    // Результат игры всё равно уходит в note.
 
-    // ---------- ключ и токен ----------
-    const API_KEY =
-      process.env.MK_API_KEY ||
-      process.env.MOYKLASS_API_KEY || "";
-
-    if (!API_KEY) {
-      return resp(500, { ok:false, error:"MK_API_KEY not set in Netlify env" }, cors);
-    }
-
-    const authRes = await fetch("https://api.moyklass.com/v1/company/auth/getToken", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ apiKey: API_KEY })
-    });
-
-    if (!authRes.ok) {
-      return resp(401, { ok:false, error:`Auth error: ${await safeText(authRes)}` }, cors);
-    }
-    const auth = await authRes.json().catch(()=> ({}));
-    const token = auth.accessToken || auth.token || auth.access_token;
-    if (!token) {
-      return resp(401, { ok:false, error:"Auth error: no token in response" }, cors);
-    }
-
-    // ---------- создаём пользователя ----------
+    // 3) создаём пользователя
     const payload = {
-      name,
-      phone,
+      name, phone,
       ...(email ? { email } : {}),
       ...(note ? { note } : {}),
-      ...(attrsOut.length ? { attributes: attrsOut } : {})
+      ...(outAttrs.length ? { attributes: outAttrs } : {})
     };
 
     const mkRes = await fetch("https://api.moyklass.com/v1/company/users", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-access-token": token
-      },
+      method:"POST",
+      headers:{ "Content-Type":"application/json", "x-access-token": token },
       body: JSON.stringify(payload)
     });
 
-    if (mkRes.status === 409) {
-      // уже существует — ок
-      return resp(200, { ok:true, status:409, message:"User exists" }, cors);
-    }
+    if (mkRes.status === 409) return j(200, { ok:true, status:409, message:"User exists" });
+    if (!mkRes.ok) return j(502, { ok:false, error:`Create user error: ${await t(mkRes)}` });
 
-    if (!mkRes.ok) {
-      return resp(502, { ok:false, error:`Create user error: ${await safeText(mkRes)}` }, cors);
-    }
-
-    const data = await mkRes.json().catch(()=> ({}));
-    return resp(200, { ok:true, data }, cors);
+    const data = await mkRes.json().catch(()=>({}));
+    return j(200, { ok:true, data });
 
   } catch (e) {
-    return resp(500, { ok:false, error:String(e && e.message ? e.message : e) }, cors);
+    return j(500, { ok:false, error: String(e && e.message ? e.message : e) });
   }
-}
 
-// helpers
-function resp(code, obj, cors) {
-  return {
-    statusCode: code,
-    headers: { ...cors, "Content-Type":"application/json" },
-    body: JSON.stringify(obj)
-  };
-}
-async function safeText(res) {
-  try { return await res.text(); } catch { return String(res.status); }
+  // helpers
+  function j(code, obj){ return { statusCode: code, headers:{ ...CORS, "Content-Type":"application/json" }, body: JSON.stringify(obj) }; }
+  async function t(res){ try{ return await res.text(); }catch{ return String(res.status); } }
+
+  function findAttrId(list, names){
+    const lc = (s)=> (s||"").toString().trim().toLowerCase();
+    for (const it of list) {
+      const id = Number(it.attributeId || it.id);
+      const code = lc(it.code || it.key || it.sysName || it.systemName);
+      const name = lc(it.name || it.title);
+      if (!Number.isFinite(id)) continue;
+      if (names.some(n => lc(n)===code || lc(n)===name)) return id;
+      // иногда код бывает "user.parent1", а name — "Родитель"; проверяем вхождения
+      if (names.some(n => code.includes(lc(n)))) return id;
+    }
+    return null;
+  }
+
+  async function fetchAttributesList(token){
+    const headers = { "x-access-token": token };
+    const candidates = [
+      "https://api.moyklass.com/v1/company/attributes",
+      "https://api.moyklass.com/v1/company/userfields/attributes",
+      "https://api.moyklass.com/v1/company/users/attributes"
+    ];
+    for (const url of candidates) {
+      try{
+        const r = await fetch(url, { headers });
+        if (r.ok) {
+          const j = await r.json().catch(()=>null);
+          if (Array.isArray(j)) return j;
+          if (j && Array.isArray(j.items)) return j.items;
+        }
+      }catch{}
+    }
+    return [];
+  }
 }
