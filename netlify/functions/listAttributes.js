@@ -1,6 +1,6 @@
-// netlify/functions/listAttributes.js
-// Возвращает список признаков (attributes) из МойКласс и выдёргивает parent1/discount.
-// GET/OPTIONS, CORS открыт.
+// netlify/functions/getUser.js
+// GET /.netlify/functions/getUser?userId=123
+// optional: &resolveAttributes=1 — попробует подтянуть каталог признаков и расшифровать id → code
 
 export async function handler(event) {
   const CORS = {
@@ -8,12 +8,8 @@ export async function handler(event) {
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "GET,OPTIONS"
   };
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: CORS, body: "" };
-  }
-  if (event.httpMethod !== "GET") {
-    return { statusCode: 405, headers: CORS, body: "Only GET" };
-  }
+  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: CORS, body: "" };
+  if (event.httpMethod !== "GET") return { statusCode: 405, headers: CORS, body: "Only GET" };
 
   try {
     const API_KEY =
@@ -24,10 +20,16 @@ export async function handler(event) {
       return json(500, { ok:false, error:"MK_API_KEY not set in Netlify env" }, CORS);
     }
 
-    // 1) токен
+    const { userId, resolveAttributes } = Object.fromEntries(new URLSearchParams(event.rawQuery || ""));
+
+    if (!userId) {
+      return json(400, { ok:false, error:"Query param 'userId' is required" }, CORS);
+    }
+
+    // 1) auth token
     const authRes = await fetch("https://api.moyklass.com/v1/company/auth/getToken", {
-      method:"POST",
-      headers:{ "Content-Type": "application/json" },
+      method: "POST",
+      headers: { "Content-Type":"application/json" },
       body: JSON.stringify({ apiKey: API_KEY })
     });
     if (!authRes.ok) {
@@ -36,56 +38,42 @@ export async function handler(event) {
     const auth = await authRes.json().catch(()=> ({}));
     const token = auth.accessToken || auth.token || auth.access_token;
     if (!token) {
-      return json(401, { ok:false, error:"Auth error: no token in response" }, CORS);
+      return json(401, { ok:false, error:"Auth error: no token" }, CORS);
     }
 
-    // 2) получаем список признаков
-    const headers = { "x-access-token": token };
-    const endpoints = [
-      "https://api.moyklass.com/v1/company/attributes",
-      "https://api.moyklass.com/v1/company/userfields/attributes",
-      "https://api.moyklass.com/v1/company/users/attributes"
-    ];
-    let list = [];
-    let used = "";
-    for (const url of endpoints) {
-      try {
-        const r = await fetch(url, { headers });
-        if (r.ok) {
-          const j = await r.json().catch(()=>null);
-          if (Array.isArray(j)) { list = j; used = url; break; }
-          if (j && Array.isArray(j.items)) { list = j.items; used = url; break; }
-        }
-      } catch {}
+    // 2) user
+    const uRes = await fetch(`https://api.moyklass.com/v1/company/users/${encodeURIComponent(userId)}`, {
+      method: "GET",
+      headers: { "x-access-token": token }
+    });
+    if (!uRes.ok) {
+      return json(404, { ok:false, error:`User fetch error: ${await safeText(uRes)}` }, CORS);
     }
-    if (!list.length) {
-      return json(502, { ok:false, error:"Cannot read attributes list from API (no known endpoint matched)" }, CORS);
-    }
+    const user = await uRes.json().catch(()=> ({}));
 
-    // Найти ID по коду/имени
-    const lc = s => (s||"").toString().trim().toLowerCase();
-    const findId = (names) => {
-      for (const it of list) {
-        const id = Number(it.attributeId || it.id);
-        const code = lc(it.code || it.key || it.sysName || it.systemName);
-        const name = lc(it.name || it.title);
-        if (!Number.isFinite(id)) continue;
-        if (names.some(n => lc(n)===code || lc(n)===name)) return id;
-        if (names.some(n => code.includes(lc(n)))) return id;
+    // 3) optionally resolve attributes ids → codes
+    let resolvedAttributes = null;
+    if (resolveAttributes) {
+      const catalog = await fetchAttributesList(token);
+      if (catalog && catalog.length) {
+        const byId = new Map(
+          catalog.map(a => [
+            Number(a.attributeId ?? a.id),
+            (a.code || a.key || a.sysName || a.systemName || a.name || a.title)
+          ])
+        );
+        resolvedAttributes = (user.attributes || []).map(a => ({
+          attributeId: a.attributeId ?? a.id,
+          code: byId.get(Number(a.attributeId ?? a.id)) || null,
+          value: a.value
+        }));
       }
-      return null;
-    };
-
-    const parent1Id = findId(["parent1","user.parent1"]);
-    const discountId = findId(["discount","user.discount"]);
+    }
 
     return json(200, {
       ok: true,
-      endpoint: used,
-      count: list.length,
-      parent1Id,
-      discountId,
-      sample: list.slice(0, 10) // чтобы не заваливать ответ — первые 10 как пример
+      user,
+      ...(resolvedAttributes ? { resolvedAttributes } : {})
     }, CORS);
 
   } catch (e) {
@@ -96,4 +84,25 @@ export async function handler(event) {
 function json(code, obj, headers) {
   return { statusCode: code, headers: { ...headers, "Content-Type":"application/json" }, body: JSON.stringify(obj) };
 }
-async function safeText(res) { try { return await res.text(); } catch { return String(res.status); } }
+async function safeText(res){ try { return await res.text(); } catch { return String(res.status); } }
+
+// Пытаемся найти каталог признаков: у разных аккаунтов путь может отличаться
+async function fetchAttributesList(token){
+  const headers = { "x-access-token": token };
+  const endpoints = [
+    "https://api.moyklass.com/v1/company/attributes",
+    "https://api.moyklass.com/v1/company/userfields/attributes",
+    "https://api.moyklass.com/v1/company/users/attributes"
+  ];
+  for (const url of endpoints) {
+    try {
+      const r = await fetch(url, { headers });
+      if (r.ok) {
+        const j = await r.json().catch(()=>null);
+        if (Array.isArray(j)) return j;
+        if (j && Array.isArray(j.items)) return j.items;
+      }
+    } catch {}
+  }
+  return [];
+}
